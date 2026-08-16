@@ -127,9 +127,8 @@ jobs:
           asset_content_type: application/gzip
 
       - name: Publish to PyPI
+        # uv publish, not twine: hatchling emits Metadata-Version 2.5, which
+        # current twine releases reject as invalid.
         env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          uv run pip install twine
-          uv run twine upload dist/*
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish
