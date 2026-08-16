@@ -15,6 +15,7 @@ from jinja2 import (
     TemplateError,
     meta,
 )
+from jinja2.sandbox import SandboxedEnvironment
 
 from ..exceptions.core import (
     PALCompilerError,
@@ -27,7 +28,14 @@ from .resolver import Resolver, ResolverCache
 
 
 class ComponentTemplateLoader(BaseLoader):
-    """Custom Jinja2 loader for PAL components."""
+    """Custom Jinja2 loader for PAL components.
+
+    This loader backs the `{% include "alias.component" %}` form, which compiles
+    the component as a template, so any Jinja in its content is rendered against
+    the surrounding context. The `{{ alias.component }}` form is different: it
+    injects the component's content as literal text and never renders it. Use
+    include when a component is meant to interpolate variables.
+    """
 
     def __init__(self, resolved_libraries: dict[str, ComponentLibrary]) -> None:
         self.resolved_libraries = resolved_libraries
@@ -95,7 +103,7 @@ class PromptCompiler:
         self.resolver = Resolver(self.loader, ResolverCache())
 
     async def compile_from_file(
-        self, pal_file: Path, variables: dict[str, Any] | None = None
+        self, pal_file: str | Path, variables: dict[str, Any] | None = None
     ) -> str:
         """Compile a PAL file into a prompt string.
 
@@ -126,7 +134,7 @@ class PromptCompiler:
         return await self.compile(prompt_assembly, variables, pal_file)
 
     def compile_from_file_sync(
-        self, pal_file: Path, variables: dict[str, Any] | None = None
+        self, pal_file: str | Path, variables: dict[str, Any] | None = None
     ) -> str:
         """Synchronous version of compile_from_file.
 
@@ -150,7 +158,7 @@ class PromptCompiler:
         self,
         prompt_assembly: PromptAssembly,
         variables: dict[str, Any] | None = None,
-        base_path: Path | None = None,
+        base_path: str | Path | None = None,
     ) -> str:
         """Compile a prompt assembly into a final prompt string.
 
@@ -179,7 +187,7 @@ class PromptCompiler:
 
         # Validate all component references exist
         validation_errors = self.resolver.validate_references(
-            prompt_assembly, resolved_libraries
+            prompt_assembly, resolved_libraries, set(variables)
         )
         if validation_errors:
             raise PALMissingComponentError(
@@ -211,7 +219,10 @@ class PromptCompiler:
         try:
             template = env.from_string(full_composition)
             compiled_prompt = template.render(**context)
-        except TemplateError as e:
+        except Exception as e:
+            # Rendering can fail with more than TemplateError: filters and
+            # expressions raise ordinary Python exceptions too. All of them are
+            # reported as PALCompilerError so callers only handle PALError.
             raise PALCompilerError(
                 f"Template error in composition: {e}",
                 context={
@@ -219,6 +230,7 @@ class PromptCompiler:
                     if len(full_composition) > 500
                     else full_composition,
                     "error": str(e),
+                    "error_type": type(e).__name__,
                     "prompt_id": prompt_assembly.id,
                 },
             ) from e
@@ -284,19 +296,37 @@ class PromptCompiler:
         self, var_definitions: list[PALVariable], typed_vars: dict[str, Any]
     ) -> None:
         """Add default values for missing variables."""
-        default_values = {
+        default_values: dict[VariableType, Any] = {
             VariableType.STRING: "",
             VariableType.LIST: [],
             VariableType.DICT: {},
             VariableType.BOOLEAN: False,
             VariableType.INTEGER: 0,
             VariableType.FLOAT: 0.0,
+            # Without an entry, an unset optional would render as "None"
+            VariableType.ANY: "",
         }
 
         for var_def in var_definitions:
             if var_def.name not in typed_vars:
                 if var_def.default is not None:
-                    typed_vars[var_def.name] = var_def.default
+                    # Declared defaults go through the same conversion as
+                    # caller-supplied values so both reach the template typed.
+                    try:
+                        typed_vars[var_def.name] = self._convert_variable(
+                            var_def.default, var_def.type
+                        )
+                    except (ValueError, TypeError) as e:
+                        raise PALCompilerError(
+                            f"Type error for default of variable '{var_def.name}': "
+                            f"expected {var_def.type}, got {type(var_def.default).__name__}",
+                            context={
+                                "variable": var_def.name,
+                                "expected_type": var_def.type,
+                                "actual_type": type(var_def.default).__name__,
+                                "value": str(var_def.default),
+                            },
+                        ) from e
                 elif not var_def.required:
                     typed_vars[var_def.name] = default_values.get(var_def.type)
 
@@ -355,23 +385,21 @@ class PromptCompiler:
     def _create_jinja_environment(
         self, resolved_libraries: dict[str, ComponentLibrary]
     ) -> Environment:
-        """Create a configured Jinja2 environment."""
+        """Create a configured Jinja2 environment.
+
+        A sandboxed environment is used because compositions and components are
+        data: they are routinely shared and may be imported over HTTP, so
+        rendering them must not grant access to the Python runtime.
+        """
         loader = ComponentTemplateLoader(resolved_libraries)
 
-        env = Environment(
+        return SandboxedEnvironment(
             loader=loader,
             undefined=StrictUndefined,  # Fail on undefined variables
             trim_blocks=True,
             lstrip_blocks=True,
             keep_trailing_newline=True,
         )
-
-        # Add custom filters if needed
-        env.filters["upper"] = str.upper
-        env.filters["lower"] = str.lower
-        env.filters["title"] = str.title
-
-        return env
 
     def _build_template_context(
         self, resolved_libraries: dict[str, ComponentLibrary], variables: dict[str, Any]
@@ -386,13 +414,25 @@ class PromptCompiler:
 
         return context
 
+    # Fenced code blocks are captured so their contents survive cleanup verbatim
+    _FENCED_BLOCK = re.compile(r"(```.*?(?:\n```|\Z))", re.DOTALL)
+
     def _clean_compiled_prompt(self, prompt: str) -> str:
-        """Clean up the compiled prompt string."""
-        # Remove excessive blank lines (more than 2 consecutive)
-        prompt = re.sub(r"\n\s*\n\s*\n+", "\n\n", prompt)
+        """Clean up the compiled prompt string.
+
+        Excessive blank lines are collapsed everywhere except inside fenced code
+        blocks, where blank lines are part of the content being shown.
+        """
+        segments = self._FENCED_BLOCK.split(prompt)
+
+        # split() with one capture group alternates: text, fence, text, fence...
+        cleaned = [
+            segment if index % 2 else re.sub(r"\n\s*\n\s*\n+", "\n\n", segment)
+            for index, segment in enumerate(segments)
+        ]
 
         # Strip leading and trailing whitespace
-        return prompt.strip()
+        return "".join(cleaned).strip()
 
     def analyze_template_variables(self, prompt_assembly: PromptAssembly) -> set[str]:
         """Analyze and extract undeclared template variables from the composition.
@@ -432,22 +472,10 @@ class PromptCompiler:
             import_aliases = set(prompt_assembly.imports.keys())
             defined_vars = {var.name for var in prompt_assembly.variables}
 
-            # Only return variables that aren't component imports or defined variables
-            for var in all_vars:
-                if var in import_aliases:
-                    # Skip import aliases (e.g., 'traits', 'reasoning')
-                    continue
-                if var in defined_vars:
-                    # Skip defined variables
-                    continue
-                if "." in var:
-                    # This is a dotted reference like "alias.component"
-                    alias = var.split(".")[0]
-                    if alias not in import_aliases:
-                        variables.add(var)
-                else:
-                    # This is a simple variable that's truly undeclared
-                    variables.add(var)
+            # Only return variables that aren't component imports or defined
+            # variables. find_undeclared_variables reports root names only, so
+            # `{{ alias.component }}` arrives here as `alias`.
+            variables.update(all_vars - import_aliases - defined_vars)
 
         except TemplateError:
             # Fallback to item-by-item analysis if full parsing fails

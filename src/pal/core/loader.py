@@ -44,13 +44,25 @@ class Loader:
         >>> # evaluation = loader.load_evaluation_suite("examples/evaluation/classify_intent.eval.yaml")  # doctest: +SKIP
     """
 
-    def __init__(self, timeout: float = 30.0) -> None:
+    #: Default ceiling for remotely loaded documents (10 MiB)
+    DEFAULT_MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
+
+    def __init__(
+        self, timeout: float = 30.0, max_download_bytes: int | None = None
+    ) -> None:
         """Initialize the loader.
 
         Args:
             timeout: Timeout in seconds for HTTP requests when loading from URLs
+            max_download_bytes: Maximum size accepted when loading from a URL.
+                Defaults to DEFAULT_MAX_DOWNLOAD_BYTES; pass None to disable.
         """
         self.timeout = timeout
+        self.max_download_bytes = (
+            self.DEFAULT_MAX_DOWNLOAD_BYTES
+            if max_download_bytes is None
+            else max_download_bytes
+        )
         self._http_client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> Loader:
@@ -60,6 +72,14 @@ class Loader:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Async context manager exit."""
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the HTTP client, if one was created.
+
+        Call this when the loader was not used as an async context manager;
+        the client is created lazily on the first URL load.
+        """
         if self._http_client:
             await self._http_client.aclose()
 
@@ -237,7 +257,10 @@ class Loader:
         try:
             response = await self._http_client.get(url)
             response.raise_for_status()
+            self._check_download_size(response, url)
             return response.text
+        except PALLoadError:
+            raise
         except httpx.HTTPStatusError as e:
             raise PALLoadError(
                 f"HTTP {e.response.status_code} error loading {url}: {e.response.text}",
@@ -253,6 +276,41 @@ class Loader:
                 f"Unexpected error loading {url}: {e}",
                 context={"url": url, "error": str(e)},
             ) from e
+
+    def _check_download_size(self, response: httpx.Response, url: str) -> None:
+        """Reject remote documents larger than max_download_bytes."""
+        limit = self.max_download_bytes
+        if limit is None:
+            return
+
+        for size in (
+            self._header_length(response),
+            self._body_length(response),
+        ):
+            if size is not None and size > limit:
+                raise PALLoadError(
+                    f"Remote file exceeds the {limit} byte limit: {url} ({size} bytes)",
+                    context={"url": url, "size": size, "limit": limit},
+                )
+
+    @staticmethod
+    def _header_length(response: httpx.Response) -> int | None:
+        """Read the declared Content-Length, if it is usable."""
+        headers = getattr(response, "headers", None)
+        if not isinstance(headers, httpx.Headers):
+            return None
+
+        declared = headers.get("content-length")
+        try:
+            return int(declared) if declared is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _body_length(response: httpx.Response) -> int | None:
+        """Measure the received body, if it is usable."""
+        content = getattr(response, "content", None)
+        return len(content) if isinstance(content, bytes | bytearray) else None
 
     def _parse_yaml(self, content: str, source: str | Path) -> dict[str, Any]:
         """Parse YAML content with error handling."""

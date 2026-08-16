@@ -90,11 +90,18 @@ class ContainsAssertion(BaseAssertion):
 
     def evaluate(self, response: str, config: dict[str, Any]) -> AssertionResult:
         text = config.get("text", "")
-        case_sensitive = config.get("case_sensitive", True)
+        case_sensitive = bool(config.get("case_sensitive", True))
 
         if not text:
             return AssertionResult(
                 "contains", False, "Missing 'text' parameter in assertion config"
+            )
+
+        if not isinstance(text, str):
+            return AssertionResult(
+                "contains",
+                False,
+                f"'text' must be a string, got {type(text).__name__}",
             )
 
         search_text = text if case_sensitive else text.lower()
@@ -115,14 +122,32 @@ class ContainsAssertion(BaseAssertion):
 class RegexMatchAssertion(BaseAssertion):
     """Assert that response matches a regex pattern."""
 
+    #: Flag names accepted in place of an integer value
+    _FLAG_NAMES = {
+        "IGNORECASE": re.IGNORECASE,
+        "I": re.IGNORECASE,
+        "MULTILINE": re.MULTILINE,
+        "M": re.MULTILINE,
+        "DOTALL": re.DOTALL,
+        "S": re.DOTALL,
+        "VERBOSE": re.VERBOSE,
+        "X": re.VERBOSE,
+        "ASCII": re.ASCII,
+        "A": re.ASCII,
+    }
+
     def evaluate(self, response: str, config: dict[str, Any]) -> AssertionResult:
         pattern = config.get("pattern", "")
-        flags = config.get("flags", 0)
 
         if not pattern:
             return AssertionResult(
                 "regex_match", False, "Missing 'pattern' parameter in assertion config"
             )
+
+        try:
+            flags = self._parse_flags(config.get("flags", 0))
+        except ValueError as e:
+            return AssertionResult("regex_match", False, f"Invalid 'flags' value: {e}")
 
         try:
             regex = re.compile(pattern, flags)
@@ -144,6 +169,33 @@ class RegexMatchAssertion(BaseAssertion):
             return AssertionResult(
                 "regex_match", False, f"Invalid regex pattern '{pattern}': {e}"
             )
+
+    @classmethod
+    def _parse_flags(cls, flags: Any) -> int:
+        """Accept an int, a flag name, or a list/'|'-separated set of names."""
+        if isinstance(flags, bool):
+            raise ValueError(f"expected an int or flag name, got {flags!r}")
+        if isinstance(flags, int):
+            return flags
+
+        if isinstance(flags, str):
+            names = [part.strip() for part in flags.replace("|", ",").split(",")]
+        elif isinstance(flags, list):
+            names = [str(part).strip() for part in flags]
+        else:
+            raise ValueError(
+                f"expected an int or flag name, got {type(flags).__name__}"
+            )
+
+        value = 0
+        for name in names:
+            if not name:
+                continue
+            try:
+                value |= cls._FLAG_NAMES[name.upper()]
+            except KeyError:
+                raise ValueError(f"unknown regex flag '{name}'") from None
+        return value
 
 
 class JSONValidAssertion(BaseAssertion):
@@ -228,9 +280,12 @@ class LengthAssertion(BaseAssertion):
     """Assert response length constraints."""
 
     def evaluate(self, response: str, config: dict[str, Any]) -> AssertionResult:
-        min_length = config.get("min_length")
-        max_length = config.get("max_length")
-        exact_length = config.get("exact_length")
+        try:
+            min_length = self._as_int(config, "min_length")
+            max_length = self._as_int(config, "max_length")
+            exact_length = self._as_int(config, "exact_length")
+        except ValueError as e:
+            return AssertionResult("length", False, str(e))
 
         response_length = len(response)
 
@@ -260,6 +315,19 @@ class LengthAssertion(BaseAssertion):
         return AssertionResult(
             "length", passed, message, expected=config, actual=response_length
         )
+
+    @staticmethod
+    def _as_int(config: dict[str, Any], key: str) -> int | None:
+        """Read an optional integer constraint from the config."""
+        value = config.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int | str | float):
+            raise ValueError(f"'{key}' must be an integer, got {type(value).__name__}")
+        try:
+            return int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"'{key}' must be an integer, got {value!r}") from e
 
 
 class EvaluationRunner:
@@ -296,13 +364,15 @@ class EvaluationRunner:
         # Load evaluation suite
         evaluation_suite = await self.loader.load_evaluation_suite_async(eval_file)
 
-        # Load prompt assembly
+        # Load prompt assembly. The originating path is kept so that relative
+        # imports resolve against the .pal file rather than the process CWD.
         if pal_file:
             prompt_assembly = await self.loader.load_prompt_assembly_async(pal_file)
+            prompt_path: Path | None = Path(pal_file)
         else:
             # Find PAL file by prompt_id
-            prompt_assembly = await self._find_prompt_assembly(
-                evaluation_suite.prompt_id, eval_file.parent
+            prompt_assembly, prompt_path = await self._find_prompt_assembly(
+                evaluation_suite.prompt_id, Path(eval_file).parent
             )
 
         # Validate version compatibility
@@ -318,7 +388,7 @@ class EvaluationRunner:
 
         for test_case in evaluation_suite.test_cases:
             test_result = await self._run_test_case(
-                test_case, prompt_assembly, model, **execution_kwargs
+                test_case, prompt_assembly, model, prompt_path, **execution_kwargs
             )
             test_results.append(test_result)
 
@@ -329,13 +399,14 @@ class EvaluationRunner:
         test_case: EvaluationTestCase,
         prompt_assembly: PromptAssembly,
         model: str,
+        base_path: Path | None = None,
         **execution_kwargs: Any,
     ) -> TestCaseResult:
         """Run a single test case."""
         try:
             # Compile prompt with test variables
             compiled_prompt = await self.compiler.compile(
-                prompt_assembly, test_case.variables
+                prompt_assembly, test_case.variables, base_path
             )
 
             # Execute prompt
@@ -372,14 +443,18 @@ class EvaluationRunner:
 
     async def _find_prompt_assembly(
         self, prompt_id: str, search_dir: Path
-    ) -> PromptAssembly:
-        """Find prompt assembly file by ID."""
+    ) -> tuple[PromptAssembly, Path]:
+        """Find prompt assembly file by ID.
+
+        Returns:
+            The matching assembly and the path it was loaded from
+        """
         # Look for .pal files in the directory
         for pal_file in search_dir.glob("**/*.pal"):
             try:
                 assembly = await self.loader.load_prompt_assembly_async(pal_file)
                 if assembly.id == prompt_id:
-                    return assembly
+                    return assembly, pal_file
             except Exception:
                 continue  # Skip invalid files
 
